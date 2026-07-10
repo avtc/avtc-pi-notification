@@ -1,6 +1,6 @@
 # avtc-pi-notification
 
-A notification extension for [pi](https://pi.dev) that alerts you via terminal bell and/or Telegram when the agent finishes, errors, or needs your attention — with smart delays that cancel when you return.
+Bell and Telegram notifications on agent completion, errors, or attention needed — only fires when you're away; inter-extension attention API included.
 
 ## Features
 
@@ -14,7 +14,7 @@ A notification extension for [pi](https://pi.dev) that alerts you via terminal b
 ## Installation
 
 ```bash
-pi install git:github.com/avtc/avtc-pi-notification
+pi install npm:avtc-pi-notification
 ```
 
 ## Configuration

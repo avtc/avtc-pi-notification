@@ -1,7 +1,7 @@
 {
   "name": "avtc-pi-notification",
-  "version": "1.0.1",
-  "description": "Notifications (terminal bell + Telegram) for Pi coding agent. Sends alerts on agent completion, retryable errors, and when the agent needs user attention.",
+  "version": "1.0.3",
+  "description": "Bell and Telegram notifications on agent completion, errors, or attention needed — only fires when you're away; inter-extension attention API included.",
   "type": "module",
   "main": "./index.ts",
   "files": [
