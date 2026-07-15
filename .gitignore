@@ -3,9 +3,5 @@ node_modules/
 .Deno/
 dist/
 
-# Parallel worktrees created by avtc-pi-feature-flow extension
 .worktrees/
-
-# feature-flow artifact junction (external storage)
-.ff
 .pi
