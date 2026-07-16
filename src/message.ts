@@ -312,6 +312,14 @@ export function buildTelegramPlainMessage(
   return `${joined.slice(0, maxLen - 20).trimEnd()}\n...(truncated)`;
 }
 
+/** Clamp an HTML/plain message pair to maxLen, appending a truncation marker when over. */
+function clampHtmlTextToMaxLen(html: string, text: string, maxLen: number): { html: string; text: string } {
+  return {
+    html: html.length <= maxLen ? html : `${htmlAwareSlice(html, maxLen - 20)}\n...(truncated)`,
+    text: text.length <= maxLen ? text : `${text.slice(0, maxLen - 20).trimEnd()}\n...(truncated)`,
+  };
+}
+
 /** Build attention notification messages (HTML + plain text) with smart truncation. */
 export function buildTelegramAttentionMessage(
   snapshot: SessionSnapshot,
@@ -349,8 +357,24 @@ export function buildTelegramAttentionMessage(
   const textLastMsg = lastMessage && lastMsgBudgetText > 50 ? `\n${truncateText(lastMessage, lastMsgBudgetText)}` : "";
   const text = fixedText + textLastMsg;
 
-  return {
-    html: html.length <= maxLen ? html : `${htmlAwareSlice(html, maxLen - 20)}\n...(truncated)`,
-    text: text.length <= maxLen ? text : `${text.slice(0, maxLen - 20).trimEnd()}\n...(truncated)`,
-  };
+  return clampHtmlTextToMaxLen(html, text, maxLen);
+}
+
+/**
+ * Build a Telegram message for a completed context compaction (no agent run — the user ran
+ * `/compact` while idle). Mirrors the attention message shape but with a "compacted" header.
+ */
+export function buildTelegramCompactMessage(
+  snapshot: SessionSnapshot,
+  maxLen: number,
+): {
+  html: string;
+  text: string;
+} {
+  const sessionIdShort = snapshot.sessionId ? snapshot.sessionId.slice(0, 8) : "";
+
+  const html = `<b>Context compacted</b>${sessionIdShort ? ` • <code>${escapeHtml(sessionIdShort)}</code>` : ""} — ready to continue\ncwd: <code>${escapeHtml(snapshot.cwd)}</code>`;
+  const text = `Context compacted${sessionIdShort ? ` • ${sessionIdShort}` : ""} — ready to continue\ncwd: ${snapshot.cwd}`;
+
+  return clampHtmlTextToMaxLen(html, text, maxLen);
 }

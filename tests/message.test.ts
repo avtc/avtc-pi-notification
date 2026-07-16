@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildTelegramAttentionMessage,
+  buildTelegramCompactMessage,
   buildTelegramMessage,
   buildTelegramPlainMessage,
   collectToolErrors,
@@ -234,5 +235,22 @@ describe("buildTelegramAttentionMessage", () => {
     const result = buildTelegramAttentionMessage(snapshot(), "src", "x", 3900);
     expect(typeof result.html).toBe("string");
     expect(typeof result.text).toBe("string");
+  });
+});
+
+describe("buildTelegramCompactMessage", () => {
+  it("renders a compacted header and cwd", () => {
+    const result = buildTelegramCompactMessage(snapshot(), 3900);
+    expect(result.html).toContain("<b>Context compacted</b>");
+    expect(result.html).toContain("ready to continue");
+    expect(result.html).toContain("cwd: <code>/home/user/project</code>");
+    expect(result.text).toContain("Context compacted");
+    expect(result.text).toContain("ready to continue");
+    expect(result.text).toContain("cwd: /home/user/project");
+  });
+
+  it("includes the short session id", () => {
+    const result = buildTelegramCompactMessage(snapshot(), 3900);
+    expect(result.html).toContain("abcdefgh");
   });
 });

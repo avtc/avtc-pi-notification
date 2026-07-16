@@ -234,5 +234,77 @@ describe("agent_end notification lifecycle", () => {
       await fire(pi, "agent_settled", { type: "agent_settled" }, ctx);
       expect(pendingTimers).toBe(2);
     });
+
+    it("manual /compact (idle, no agent run): schedules a bell via session_compact", async () => {
+      // A user runs /compact while idle — no agent_end/agent_settled fires. Without a
+      // session_compact listener, the user (who may have walked away) gets no bell.
+      const { pi, ctx } = createMockPi(() => false);
+      extension(pi);
+
+      await fire(pi, "session_start", {}, ctx);
+      // No agent_start/agent_end — pure idle manual compact.
+      await fire(
+        pi,
+        "session_compact",
+        {
+          type: "session_compact",
+          compactionEntry: { id: "c1", type: "compaction" },
+          fromExtension: false,
+          reason: "manual",
+          willRetry: false,
+        },
+        ctx,
+      );
+      expect(pendingTimers).toBe(2);
+    });
+
+    it("session_compact skips scheduling when an agent run will carry it (pendingMessages set)", async () => {
+      // Auto-compaction path: agent_end fired (captured), so agent_settled will schedule.
+      // session_compact must NOT also schedule (avoid redundancy).
+      const { pi, ctx } = createMockPi(() => false);
+      extension(pi);
+
+      await fire(pi, "session_start", {}, ctx);
+      await fire(pi, "agent_start", {}, ctx);
+      await fire(pi, "agent_end", agentEndEvent(), ctx); // captures pendingMessages
+      await fire(
+        pi,
+        "session_compact",
+        {
+          type: "session_compact",
+          compactionEntry: { id: "c1", type: "compaction" },
+          fromExtension: false,
+          reason: "threshold",
+          willRetry: false,
+        },
+        ctx,
+      );
+      expect(pendingTimers).toBe(0); // agent_settled will schedule, not session_compact
+    });
+
+    it("a steer after /compact cancels the compact notification (agent_start)", async () => {
+      // After a manual /compact schedules a bell, a user steer starts a run → agent_start
+      // cancels the timer (the user is back and engaged).
+      const { pi, ctx } = createMockPi(() => false);
+      extension(pi);
+
+      await fire(pi, "session_start", {}, ctx);
+      await fire(
+        pi,
+        "session_compact",
+        {
+          type: "session_compact",
+          compactionEntry: { id: "c1", type: "compaction" },
+          fromExtension: false,
+          reason: "manual",
+          willRetry: false,
+        },
+        ctx,
+      );
+      expect(pendingTimers).toBe(2);
+
+      await fire(pi, "agent_start", {}, ctx);
+      expect(pendingTimers).toBe(0);
+    });
   });
 });

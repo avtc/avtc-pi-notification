@@ -1,6 +1,6 @@
 {
   "name": "avtc-pi-notification",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Bell and Telegram notifications on agent completion, errors, or attention needed — only fires when you're away; inter-extension attention API included.",
   "type": "module",
   "main": "./index.ts",

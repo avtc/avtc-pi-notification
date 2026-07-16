@@ -74,12 +74,14 @@ The agent directory can be customized via the `PI_CODING_AGENT_DIR` environment 
 
 ## How delays work
 
-On agent finish — or when attention is needed — both timers start and run independently:
+When the agent finishes its run — after any automatic retry or context compaction has completed — or when attention is needed, both timers start and run independently:
 
 1. **Bell** fires at 30s — you may be in another window; the bell brings you back.
 2. **Telegram** fires at 2m — you're truly away from the computer.
 
 Either timer is cancelled if you press a key, focus the terminal, or the agent continues.
+
+The timers also start after a manual context compaction (`/compact`) run while the agent is idle, so you're notified if you walk away during summarization. A follow-up message or steer cancels it.
 
 ## Commands
 

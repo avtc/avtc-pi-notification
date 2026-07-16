@@ -2,7 +2,12 @@
 // SPDX-FileCopyrightText: 2026 avtc <tarasenkov@gmail.com>
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { buildTelegramAttentionMessage, buildTelegramMessage, buildTelegramPlainMessage } from "./message.js";
+import {
+  buildTelegramAttentionMessage,
+  buildTelegramCompactMessage,
+  buildTelegramMessage,
+  buildTelegramPlainMessage,
+} from "./message.js";
 import { EMPTY_SETTING_FALLBACK, getSetting, loadMergedSettings, parseDelayMs } from "./settings.js";
 import { coerceChatId, maskToken, readRetryConfig, sendTelegram, telegramCall } from "./telegram.js";
 import type { JsonObject, NotificationApi, SessionSnapshot } from "./types.js";
@@ -274,6 +279,41 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
+  /**
+   * Schedule the completion bell + Telegram timers from a settled/compacted snapshot.
+   * Shared by agent_settled (run completion) and session_compact (idle compaction). Bell and
+   * Telegram both reload fresh settings at fire time; only the Telegram message differs,
+   * supplied by buildTelegramPayload.
+   */
+  function scheduleCompletionTimers(
+    ctx: ExtensionContext,
+    snapshot: SessionSnapshot,
+    buildTelegramPayload: (snapshot: SessionSnapshot, freshSettings: JsonObject) => { html: string; text: string },
+  ) {
+    const { settings } = loadMergedSettings(ctx.cwd, ctx);
+    const bellDelayMs = parseDelayMs(
+      getSetting(settings, "avtc-pi-notifications.bellDelay", "30s"),
+      DEFAULT_BELL_DELAY_MS,
+    );
+    const telegramDelayMs = parseDelayMs(
+      getSetting(settings, "avtc-pi-notifications.telegram.delay", "2m"),
+      DEFAULT_TELEGRAM_DELAY_MS,
+    );
+
+    bellTimer = setTimeout(() => {
+      bellTimer = null;
+      const { settings: freshSettings } = loadMergedSettings(snapshot.cwd, NO_EXTENSION_CONTEXT);
+      ringBell(freshSettings);
+    }, bellDelayMs);
+
+    telegramTimer = setTimeout(() => {
+      telegramTimer = null;
+      const { settings: freshSettings } = loadMergedSettings(snapshot.cwd, NO_EXTENSION_CONTEXT);
+      const payload = buildTelegramPayload(snapshot, freshSettings);
+      sendTelegramNotification(payload, freshSettings);
+    }, telegramDelayMs);
+  }
+
   // agent_settled: the agent run has fully settled — no automatic retry, compaction, or queued
   // continuation will run. This is the true idle point, so the completion timers start here.
   // Scheduling at agent_end would tick through the compaction summarization call (which runs
@@ -302,31 +342,43 @@ export default function (pi: ExtensionAPI) {
     // Nothing captured (should not happen — agent_end always precedes agent_settled).
     if (!messages || !snapshot) return;
 
-    const { settings } = loadMergedSettings(ctx.cwd, ctx);
-    const bellDelayMs = parseDelayMs(
-      getSetting(settings, "avtc-pi-notifications.bellDelay", "30s"),
-      DEFAULT_BELL_DELAY_MS,
-    );
-    const telegramDelayMs = parseDelayMs(
-      getSetting(settings, "avtc-pi-notifications.telegram.delay", "2m"),
-      DEFAULT_TELEGRAM_DELAY_MS,
-    );
-
-    bellTimer = setTimeout(() => {
-      bellTimer = null;
-      const { settings: freshSettings } = loadMergedSettings(snapshot.cwd, NO_EXTENSION_CONTEXT);
-      ringBell(freshSettings);
-    }, bellDelayMs);
-
-    telegramTimer = setTimeout(() => {
-      telegramTimer = null;
-      const { settings: freshSettings } = loadMergedSettings(snapshot.cwd, NO_EXTENSION_CONTEXT);
-      const htmlMessage = buildTelegramMessage(snapshot, messages, freshSettings, 3900);
-      const plainMessage = buildTelegramPlainMessage(snapshot, messages, freshSettings, 3900);
-      sendTelegramNotification({ html: htmlMessage, text: plainMessage }, freshSettings);
-    }, telegramDelayMs);
+    scheduleCompletionTimers(ctx, snapshot, (snap, freshSettings) => {
+      const htmlMessage = buildTelegramMessage(snap, messages, freshSettings, 3900);
+      const plainMessage = buildTelegramPlainMessage(snap, messages, freshSettings, 3900);
+      return { html: htmlMessage, text: plainMessage };
+    });
   });
 
+  // session_compact: a compaction just completed. Schedule a notification when no agent run
+  // will carry one via agent_settled — i.e. when agent_end did not fire (pendingMessages is
+  // null). This covers a user running /compact while idle: no agent run, so agent_settled never
+  // fires, and without this the user (who may have walked away during summarization) gets no
+  // bell. If a continuation follows (extension inject / user steer), its agent_start cancels
+  // this timer. When an agent run DID carry the notification (pendingMessages set), skip —
+  // agent_settled (firing after the compaction window) schedules it.
+  pi.on("session_compact", async (_event, ctx) => {
+    if (isSubagentSession(ctx.mode)) return;
+    // An agent run is in flight (or about to settle) — agent_settled owns the notification.
+    if (pendingMessages !== null) return;
+
+    cancelTimers();
+    if (attentionNotified) {
+      attentionNotified = false;
+      return;
+    }
+
+    const snapshot: SessionSnapshot = {
+      cwd: ctx.cwd,
+      sessionHeader: ctx.sessionManager.getHeader(),
+      sessionId: ctx.sessionManager.getSessionId(),
+      leafId: ctx.sessionManager.getLeafId(),
+    };
+
+    scheduleCompletionTimers(ctx, snapshot, (snap) => {
+      const compactMsg = buildTelegramCompactMessage(snap, 3900);
+      return { html: compactMsg.html, text: compactMsg.text };
+    });
+  });
   pi.registerCommand("notification:notify", {
     description: "Test notifications (use: /notification:notify debug)",
     handler: async (args, ctx) => {
