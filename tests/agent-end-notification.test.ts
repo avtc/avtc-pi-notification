@@ -118,6 +118,8 @@ describe("agent_end notification lifecycle", () => {
       await fire(pi, "agent_start", {}, ctx);
       await fire(pi, "agent_end", agentEndEvent(), ctx);
     }
+    // The run settles here — completion timers are scheduled at agent_settled, not agent_end.
+    await fire(pi, "agent_settled", { type: "agent_settled" }, ctx);
   }
 
   it("schedules a notification after retry exhaustion (isStreaming=true at agent_end)", async () => {
@@ -128,25 +130,42 @@ describe("agent_end notification lifecycle", () => {
     extension(pi);
     await runRetryExhaustion(pi, ctx, 9);
 
-    // The final agent_end (exhaustion) must have scheduled bell + telegram.
+    // The final agent_settled (after exhaustion) must have scheduled bell + telegram.
     expect(pendingTimers).toBe(2);
   });
 
-  it("does not accumulate timers across intermediate retries (agent_start cancels)", async () => {
+  it("does NOT schedule at agent_end (scheduling deferred to agent_settled)", async () => {
+    // agent_end captures messages but must not start timers: compaction runs between
+    // agent_end and agent_settled, and scheduling at agent_end would tick through it.
     const { pi, ctx } = createMockPi(() => false);
     extension(pi);
 
     await fire(pi, "session_start", {}, ctx);
     await fire(pi, "agent_start", {}, ctx);
     await fire(pi, "agent_end", agentEndEvent(), ctx);
-    // After the first agent_end, exactly 2 timers are pending.
-    expect(pendingTimers).toBe(2);
 
-    // Retry continuation: agent_start must cancel those timers...
+    // No timers scheduled yet — agent_end only captures.
+    expect(pendingTimers).toBe(0);
+  });
+
+  it("does not accumulate timers across intermediate retries (agent_start cancels, agent_settled schedules once)", async () => {
+    const { pi, ctx } = createMockPi(() => false);
+    extension(pi);
+
+    await fire(pi, "session_start", {}, ctx);
+    await fire(pi, "agent_start", {}, ctx);
+    await fire(pi, "agent_end", agentEndEvent(), ctx);
+    // agent_end does not schedule; nothing pending.
+    expect(pendingTimers).toBe(0);
+
+    // Retry continuation: agent_start (no-op cancel), agent_end (capture only).
     await fire(pi, "agent_start", {}, ctx);
     expect(pendingTimers).toBe(0);
-    // ...and agent_end schedules fresh ones (net still 2, not 4).
     await fire(pi, "agent_end", agentEndEvent(), ctx);
+    expect(pendingTimers).toBe(0);
+
+    // agent_settled schedules exactly one bell + one telegram (net 2, not accumulated).
+    await fire(pi, "agent_settled", { type: "agent_settled" }, ctx);
     expect(pendingTimers).toBe(2);
   });
 
@@ -157,6 +176,7 @@ describe("agent_end notification lifecycle", () => {
     await fire(pi, "session_start", {}, ctx);
     await fire(pi, "agent_start", {}, ctx);
     await fire(pi, "agent_end", { type: "agent_end", messages: [{ role: "assistant", content: "all done" }] }, ctx);
+    await fire(pi, "agent_settled", { type: "agent_settled" }, ctx);
 
     expect(pendingTimers).toBe(2);
   });
@@ -169,7 +189,50 @@ describe("agent_end notification lifecycle", () => {
     await fire(pi, "agent_start", {}, ctx);
     const subagentCtx = { ...ctx, mode: "rpc" as const };
     await fire(pi, "agent_end", agentEndEvent(), subagentCtx);
+    await fire(pi, "agent_settled", { type: "agent_settled" }, subagentCtx);
 
     expect(pendingTimers).toBe(0);
+  });
+
+  describe("compaction window (schedule on agent_settled, not agent_end)", () => {
+    it("pi auto-compaction path: schedules only after compaction (agent_settled fires last)", async () => {
+      // pi's own auto-compaction runs in _handlePostAgentRun AFTER agent_end and BEFORE
+      // agent_settled. agent_end must NOT schedule (it only captures): otherwise the bell/
+      // telegram timers would tick through the summarization call and fire mid-compaction.
+      // No timer is pending during the compaction window; agent_settled schedules once idle.
+      const { pi, ctx } = createMockPi(() => false);
+      extension(pi);
+
+      await fire(pi, "session_start", {}, ctx);
+      await fire(pi, "agent_start", {}, ctx);
+      // agent_end captures but does NOT schedule — no timer during the compaction window.
+      await fire(pi, "agent_end", agentEndEvent(), ctx);
+      expect(pendingTimers).toBe(0);
+
+      // (compaction runs here, between agent_end and agent_settled — no timer to tick)
+
+      // Now the run settles — timers scheduled.
+      await fire(pi, "agent_settled", { type: "agent_settled" }, ctx);
+      expect(pendingTimers).toBe(2);
+    });
+
+    it("reschedules after a continuation run (inject → agent_start → agent_end → agent_settled)", async () => {
+      // After an extension compaction (or any continuation) starts a new run, that run's
+      // agent_settled schedules the completion notification for its result.
+      const { pi, ctx } = createMockPi(() => false);
+      extension(pi);
+
+      await fire(pi, "session_start", {}, ctx);
+      await fire(pi, "agent_start", {}, ctx);
+      await fire(pi, "agent_end", agentEndEvent(), ctx);
+      await fire(pi, "agent_settled", { type: "agent_settled" }, ctx);
+
+      // Continuation: agent_start cancels prior timers; the new run schedules fresh ones.
+      await fire(pi, "agent_start", {}, ctx);
+      expect(pendingTimers).toBe(0);
+      await fire(pi, "agent_end", agentEndEvent(), ctx);
+      await fire(pi, "agent_settled", { type: "agent_settled" }, ctx);
+      expect(pendingTimers).toBe(2);
+    });
   });
 });

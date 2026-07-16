@@ -64,6 +64,18 @@ export default function (pi: ExtensionAPI) {
   /** AbortController for in-flight Telegram retries; aborted on shutdown so the app can exit. */
   let telegramAbort: AbortController | null = null;
 
+  /**
+   * Messages + ctx-snapshot captured at agent_end and consumed at agent_settled.
+   * `agent_settled` carries no message content (`{ type: "agent_settled" }`), and the
+   * bell/Telegram bodies are built from the agent messages — so they must be captured
+   * at agent_end (the only event that carries them). Scheduling moves to agent_settled
+   * (see below); these hold the last agent_end's payload until then. Each agent_end
+   * overwrites, so agent_settled (which fires once per run, after all retries/compaction)
+   * always sees the final messages.
+   */
+  let pendingMessages: unknown[] | null = null;
+  let pendingSnapshot: SessionSnapshot | null = null;
+
   function cancelTimers(): void {
     if (bellTimer) {
       clearTimeout(bellTimer);
@@ -111,6 +123,8 @@ export default function (pi: ExtensionAPI) {
     // retries so no pending timers/sleeps keep the event loop alive on exit.
     rootCtx = null;
     cancelTimers();
+    pendingMessages = null;
+    pendingSnapshot = null;
     telegramAbort?.abort();
     telegramAbort = null;
     attentionNotified = false;
@@ -222,19 +236,60 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // Notify once per agent loop (one user prompt), not once per turn.
+  // agent_end: capture the agent's messages + a ctx-snapshot for the agent_settled scheduler.
+  // We do NOT schedule timers here. In pi's lifecycle, auto-compaction runs AFTER agent_end (in
+  // _handlePostAgentRun, BEFORE agent_settled): if we scheduled at agent_end, the bell/telegram
+  // timers would tick through the summarization call (which can take many seconds) and fire a
+  // false "done" notification while the session is still working. Scheduling is deferred to
+  // agent_settled (next handler), which fires only after retry/compaction/continuation resolve.
+  //
+  // agent_settled carries no message content, so the messages + snapshot must be captured here.
+  // (Extension ctx.compact() aborts mid-turn and suppresses this agent_end via
+  // _disconnectFromAgent, so the notification simply sees no capture for that abort — the
+  // subsequent continuation's own agent_end/agent_settled schedules the notification instead.)
   pi.on("agent_end", async (event, ctx) => {
     if (isSubagentSession(ctx.mode)) return;
     // NOTE: do NOT guard on ctx.isIdle(). pi keeps session.isStreaming = true for
     // the entire duration of the agent_end listeners (it is only cleared in
     // Agent.finishRun() AFTER all listeners settle), so isIdle() returns false
     // for EVERY agent_end. Guarding here (as a previous version did) silently
-    // suppressed all completion/retry-exhaustion notifications. agent_end only
-    // fires at the end of an agent loop, so it is never "mid-stream".
+    // suppressed all completion/retry-exhaustion notifications.
     // Retry noise is already handled: each retry continuation emits agent_start,
     // whose handler cancels pending timers and resets attentionNotified.
 
-    // Cancel any pending timers — agent loop ended.
+    // Cancel any pending timers — the agent loop ended. Clears a mid-turn
+    // requestAttention timer so a fresh completion schedule is built at agent_settled.
+    cancelTimers();
+
+    // Capture the agent's messages + a ctx-snapshot for the agent_settled scheduler.
+    // ctx may become stale if auto-agent triggers newSession/switchSession before the
+    // timer fires, so the ctx-derived values are snapshotted now (agent_end and
+    // agent_settled belong to the same run, so this is the correct point).
+    pendingMessages = event.messages as unknown[];
+    pendingSnapshot = {
+      cwd: ctx.cwd,
+      sessionHeader: ctx.sessionManager.getHeader(),
+      sessionId: ctx.sessionManager.getSessionId(),
+      leafId: ctx.sessionManager.getLeafId(),
+    };
+  });
+
+  // agent_settled: the agent run has fully settled — no automatic retry, compaction, or queued
+  // continuation will run. This is the true idle point, so the completion timers start here.
+  // Scheduling at agent_end would tick through the compaction summarization call (which runs
+  // after agent_end, before agent_settled) and fire a false notification mid-compaction.
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (isSubagentSession(ctx.mode)) return;
+
+    // Consume the payload captured at agent_end (clear first so a later session_shutdown / new
+    // run never reuses it). agent_end always precedes agent_settled within a run, so this is set.
+    const messages = pendingMessages;
+    const snapshot = pendingSnapshot;
+    pendingMessages = null;
+    pendingSnapshot = null;
+
+    // Defensive: clear any timer still pending (e.g. a requestAttention timer that fired between
+    // agent_end and here), then decide whether to schedule.
     cancelTimers();
 
     // If we already sent an attention notification (tool blocked too long),
@@ -243,6 +298,9 @@ export default function (pi: ExtensionAPI) {
       attentionNotified = false;
       return;
     }
+
+    // Nothing captured (should not happen — agent_end always precedes agent_settled).
+    if (!messages || !snapshot) return;
 
     const { settings } = loadMergedSettings(ctx.cwd, ctx);
     const bellDelayMs = parseDelayMs(
@@ -253,17 +311,6 @@ export default function (pi: ExtensionAPI) {
       getSetting(settings, "avtc-pi-notifications.telegram.delay", "2m"),
       DEFAULT_TELEGRAM_DELAY_MS,
     );
-
-    const messages = event.messages as unknown[];
-
-    // Snapshot ctx-derived values now — ctx may become stale if auto-agent
-    // triggers newSession/switchSession before the timer fires.
-    const snapshot: SessionSnapshot = {
-      cwd: ctx.cwd,
-      sessionHeader: ctx.sessionManager.getHeader(),
-      sessionId: ctx.sessionManager.getSessionId(),
-      leafId: ctx.sessionManager.getLeafId(),
-    };
 
     bellTimer = setTimeout(() => {
       bellTimer = null;
