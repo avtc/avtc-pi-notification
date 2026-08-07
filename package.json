@@ -1,6 +1,6 @@
 {
   "name": "avtc-pi-notification",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Bell and Telegram notifications on agent completion, errors, or attention needed — only fires when you're away; inter-extension attention API included.",
   "type": "module",
   "main": "./index.ts",
@@ -40,7 +40,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.0",
-    "@earendil-works/pi-coding-agent": "^0.80.6",
+    "@earendil-works/pi-coding-agent": "^0.84.1",
     "@types/node": "^25.9.3",
     "jscpd": "^5.0.10",
     "knip": "^6.17.1",
