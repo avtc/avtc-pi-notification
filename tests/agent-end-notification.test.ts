@@ -306,5 +306,65 @@ describe("agent_end notification lifecycle", () => {
       await fire(pi, "agent_start", {}, ctx);
       expect(pendingTimers).toBe(0);
     });
+
+    it("extension-triggered compact abort stays transparent (pi #7370): no mid-compaction notification", async () => {
+      // pi 0.84.0+ (#7370) removed _disconnectFromAgent() from compact(), so ctx.compact()'s
+      // up-front abort() now reaches extensions as agent_end with stopReason "error" +
+      // "This operation was aborted". Previously this agent_end was suppressed. If captured,
+      // the immediately-following agent_settled (run loop exits in _runAgent's finally) would
+      // schedule the bell/telegram, which then tick THROUGH the multi-minute summarization
+      // and fire a false "done" notification mid-compaction. The abort must stay transparent:
+      // no capture → agent_settled is a no-op; session_compact + the continuation's
+      // agent_start/agent_end/agent_settled handle the notification (matching pre-#7370).
+      const { pi, ctx } = createMockPi(() => false);
+      extension(pi);
+
+      await fire(pi, "session_start", {}, ctx);
+      await fire(pi, "agent_start", {}, ctx);
+      // The compact abort's agent_end — must NOT capture.
+      await fire(
+        pi,
+        "agent_end",
+        {
+          type: "agent_end",
+          messages: [
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "" }],
+              stopReason: "error",
+              errorMessage: "This operation was aborted",
+            },
+          ],
+        },
+        ctx,
+      );
+      // agent_settled fires right after the abort (run loop exits) — nothing captured → no schedule.
+      await fire(pi, "agent_settled", { type: "agent_settled" }, ctx);
+      expect(pendingTimers).toBe(0);
+
+      // Compaction completes → session_compact schedules (idle path; no agent run carries it).
+      await fire(
+        pi,
+        "session_compact",
+        {
+          type: "session_compact",
+          compactionEntry: { id: "c1", type: "compaction" },
+          fromExtension: true,
+          reason: "manual",
+          willRetry: false,
+        },
+        ctx,
+      );
+      expect(pendingTimers).toBe(2);
+
+      // The injected continuation starts shortly after → agent_start cancels (no false notification).
+      await fire(pi, "agent_start", {}, ctx);
+      expect(pendingTimers).toBe(0);
+
+      // Continuation completes → schedules correctly.
+      await fire(pi, "agent_end", agentEndEvent(), ctx);
+      await fire(pi, "agent_settled", { type: "agent_settled" }, ctx);
+      expect(pendingTimers).toBe(2);
+    });
   });
 });

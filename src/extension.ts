@@ -249,9 +249,8 @@ export default function (pi: ExtensionAPI) {
   // agent_settled (next handler), which fires only after retry/compaction/continuation resolve.
   //
   // agent_settled carries no message content, so the messages + snapshot must be captured here.
-  // (Extension ctx.compact() aborts mid-turn and suppresses this agent_end via
-  // _disconnectFromAgent, so the notification simply sees no capture for that abort — the
-  // subsequent continuation's own agent_end/agent_settled schedules the notification instead.)
+  // (Extension ctx.compact()'s abort used to be suppressed via _disconnectFromAgent, so this
+  // handler never saw it; pi 0.84.0+ #7370 removed that suppression — see the abort guard below.)
   pi.on("agent_end", async (event, ctx) => {
     if (isSubagentSession(ctx.mode)) return;
     // NOTE: do NOT guard on ctx.isIdle(). pi keeps session.isStreaming = true for
@@ -265,6 +264,29 @@ export default function (pi: ExtensionAPI) {
     // Cancel any pending timers — the agent loop ended. Clears a mid-turn
     // requestAttention timer so a fresh completion schedule is built at agent_settled.
     cancelTimers();
+
+    // pi 0.84.0+ (#7370): ctx.compact()'s up-front abort() now reaches extensions as agent_end
+    // (previously suppressed via _disconnectFromAgent). The abort carries a terminal assistant
+    // message with stopReason "error" + "This operation was aborted". Capturing it would make
+    // the immediately-following agent_settled (run loop exits in _runAgent's finally) schedule
+    // the bell/telegram, which then tick THROUGH the multi-minute compaction summarization and
+    // fire a false "done" notification mid-compaction. Stay transparent: do NOT capture —
+    // agent_settled then no-ops (nothing captured), and the compaction's session_compact + the
+    // injected continuation's agent_start/agent_end/agent_settled handle the notification
+    // (matching pre-#7370, where this abort's agent_end never fired to extensions).
+    const endMessages = event.messages as Array<{
+      role?: string;
+      stopReason?: string;
+      errorMessage?: string;
+    }>;
+    const lastEndMessage = endMessages[endMessages.length - 1];
+    if (
+      lastEndMessage?.role === "assistant" &&
+      lastEndMessage.stopReason === "error" &&
+      lastEndMessage.errorMessage === "This operation was aborted"
+    ) {
+      return;
+    }
 
     // Capture the agent's messages + a ctx-snapshot for the agent_settled scheduler.
     // ctx may become stale if auto-agent triggers newSession/switchSession before the
