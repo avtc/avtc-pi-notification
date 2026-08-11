@@ -265,29 +265,6 @@ export default function (pi: ExtensionAPI) {
     // requestAttention timer so a fresh completion schedule is built at agent_settled.
     cancelTimers();
 
-    // pi 0.84.0+ (#7370): ctx.compact()'s up-front abort() now reaches extensions as agent_end
-    // (previously suppressed via _disconnectFromAgent). The abort carries a terminal assistant
-    // message with stopReason "error" + "This operation was aborted". Capturing it would make
-    // the immediately-following agent_settled (run loop exits in _runAgent's finally) schedule
-    // the bell/telegram, which then tick THROUGH the multi-minute compaction summarization and
-    // fire a false "done" notification mid-compaction. Stay transparent: do NOT capture —
-    // agent_settled then no-ops (nothing captured), and the compaction's session_compact + the
-    // injected continuation's agent_start/agent_end/agent_settled handle the notification
-    // (matching pre-#7370, where this abort's agent_end never fired to extensions).
-    const endMessages = event.messages as Array<{
-      role?: string;
-      stopReason?: string;
-      errorMessage?: string;
-    }>;
-    const lastEndMessage = endMessages[endMessages.length - 1];
-    if (
-      lastEndMessage?.role === "assistant" &&
-      lastEndMessage.stopReason === "error" &&
-      lastEndMessage.errorMessage === "This operation was aborted"
-    ) {
-      return;
-    }
-
     // Capture the agent's messages + a ctx-snapshot for the agent_settled scheduler.
     // ctx may become stale if auto-agent triggers newSession/switchSession before the
     // timer fires, so the ctx-derived values are snapshotted now (agent_end and
@@ -369,6 +346,29 @@ export default function (pi: ExtensionAPI) {
       const plainMessage = buildTelegramPlainMessage(snap, messages, freshSettings, 3900);
       return { html: htmlMessage, text: plainMessage };
     });
+  });
+
+  // session_before_compact: pi dispatches this to extensions the instant compact() aborts the
+  // current run and BEFORE the (potentially multi-minute) summarization. For an
+  // extension-triggered compaction, the abort's agent_end already captured pendingMessages and
+  // the immediately-following agent_settled already scheduled the bell/telegram — those timers
+  // would otherwise tick THROUGH summarization and fire a false "done" notification mid-compaction
+  // (the user has seen these arrive showing the abort's raw error, e.g. "terminated" /
+  // "This operation was aborted").
+  //
+  // This is the EARLIEST extension-visible signal that a compaction is starting: pi's own
+  // compaction_start / compaction_end are internal-only (this._emit, NOT in the ExtensionEvent
+  // union and never dispatched to extension handlers), and session_compact fires only AFTER
+  // summarization — far too late to beat the 30s bell. session_before_compact lands within
+  // milliseconds of agent_settled (only sync setup — abort cleanup, auth read, prepareCompaction —
+  // runs in between), so cancelling here is reliable and STRING-INDEPENDENT: it does not matter
+  // how the provider surfaces the abort (zai-proxy/glm reports "This operation was aborted" OR
+  // "terminated"; vLLM and others vary again). A genuine error (429, retry-exhaustion, …) is never
+  // followed by a compaction, so its notification still fires correctly. Registering this handler
+  // also guarantees pi emits the event (hasHandlers becomes true).
+  pi.on("session_before_compact", async (_event, ctx) => {
+    if (isSubagentSession(ctx.mode)) return;
+    cancelTimers();
   });
 
   // session_compact: a compaction just completed. Schedule a notification when no agent run

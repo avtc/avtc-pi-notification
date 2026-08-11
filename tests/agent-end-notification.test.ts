@@ -307,21 +307,24 @@ describe("agent_end notification lifecycle", () => {
       expect(pendingTimers).toBe(0);
     });
 
-    it("extension-triggered compact abort stays transparent (pi #7370): no mid-compaction notification", async () => {
+    it("extension-triggered compact abort stays transparent (pi #7370): session_before_compact cancels mid-compaction timers", async () => {
       // pi 0.84.0+ (#7370) removed _disconnectFromAgent() from compact(), so ctx.compact()'s
-      // up-front abort() now reaches extensions as agent_end with stopReason "error" +
-      // "This operation was aborted". Previously this agent_end was suppressed. If captured,
-      // the immediately-following agent_settled (run loop exits in _runAgent's finally) would
-      // schedule the bell/telegram, which then tick THROUGH the multi-minute summarization
-      // and fire a false "done" notification mid-compaction. The abort must stay transparent:
-      // no capture → agent_settled is a no-op; session_compact + the continuation's
-      // agent_start/agent_end/agent_settled handle the notification (matching pre-#7370).
+      // up-front abort() now reaches extensions as agent_end. The provider surfaces that abort
+      // with a VARIABLE errorMessage — zai-proxy/glm reports "This operation was aborted" OR
+      // "terminated" (and vLLM/others differ again) — so a string guard is too fragile. pi's own
+      // compaction_start is internal-only (not in the ExtensionEvent union), so the earliest
+      // extension-visible signal that a compaction is starting is session_before_compact, which
+      // fires right after the abort and BEFORE the multi-minute summarization — within the 30s
+      // bell window. Cancelling there is reliable and string-independent. A genuine error
+      // (429 / retry-exhaustion) is never followed by a compaction, so its notification still
+      // fires (see the next test).
       const { pi, ctx } = createMockPi(() => false);
       extension(pi);
 
       await fire(pi, "session_start", {}, ctx);
       await fire(pi, "agent_start", {}, ctx);
-      // The compact abort's agent_end — must NOT capture.
+      // The compact abort's agent_end — here surfaced as "terminated" (NOT "This operation was
+      // aborted"). It is captured (as any agent_end is); agent_settled then schedules timers.
       await fire(
         pi,
         "agent_end",
@@ -332,17 +335,29 @@ describe("agent_end notification lifecycle", () => {
               role: "assistant",
               content: [{ type: "text", text: "" }],
               stopReason: "error",
-              errorMessage: "This operation was aborted",
+              errorMessage: "terminated",
             },
           ],
         },
         ctx,
       );
-      // agent_settled fires right after the abort (run loop exits) — nothing captured → no schedule.
+      // agent_settled fires right after the abort (run loop exits in _runAgent's finally) — it
+      // schedules the bell/telegram (which would tick through summarization and fire mid-compaction).
       await fire(pi, "agent_settled", { type: "agent_settled" }, ctx);
+      expect(pendingTimers).toBe(2);
+
+      // session_before_compact fires milliseconds later, BEFORE summarization — it MUST cancel
+      // those timers so nothing ticks through the multi-minute compaction.
+      await fire(
+        pi,
+        "session_before_compact",
+        { type: "session_before_compact", reason: "manual", willRetry: false },
+        ctx,
+      );
       expect(pendingTimers).toBe(0);
 
-      // Compaction completes → session_compact schedules (idle path; no agent run carries it).
+      // Compaction completes → session_compact schedules the idle-path timer (no agent run
+      // carries it: pendingMessages was consumed at agent_settled).
       await fire(
         pi,
         "session_compact",
@@ -365,6 +380,37 @@ describe("agent_end notification lifecycle", () => {
       await fire(pi, "agent_end", agentEndEvent(), ctx);
       await fire(pi, "agent_settled", { type: "agent_settled" }, ctx);
       expect(pendingTimers).toBe(2);
+    });
+
+    it("a genuine error NOT followed by a compaction still notifies (regression guard)", async () => {
+      // session_before_compact is what neutralizes the abort's timers; a real error is never
+      // followed by a compaction, so its bell/telegram must fire normally. Guards against
+      // over-broad suppression (e.g. matching on usage===0, which a 429 rate-limit also has).
+      const { pi, ctx } = createMockPi(() => false);
+      extension(pi);
+
+      await fire(pi, "session_start", {}, ctx);
+      await fire(pi, "agent_start", {}, ctx);
+      // A genuine 429 rate-limit error (usage 0, like an abort — but real).
+      await fire(
+        pi,
+        "agent_end",
+        {
+          type: "agent_end",
+          messages: [
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "" }],
+              stopReason: "error",
+              errorMessage: '429 {"error":{"type":"rate_limit_error","message":"Usage limit reached"}}',
+            },
+          ],
+        },
+        ctx,
+      );
+      await fire(pi, "agent_settled", { type: "agent_settled" }, ctx);
+      expect(pendingTimers).toBe(2);
+      // No session_before_compact ever fires for a real error → timers stay live (notification fires).
     });
   });
 });
